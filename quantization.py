@@ -37,6 +37,19 @@ JPEG_LUMINANCE_QUANTIZATION_MATRIX = np.array(
     dtype=np.float64
 )
 
+JPEG_CHROMINANCE_QUANTIZATION_MATRIX = np.array(
+    [
+        [17, 18, 24, 47, 99, 99, 99, 99],
+        [18, 21, 26, 66, 99, 99, 99, 99],
+        [24, 26, 56, 99, 99, 99, 99, 99],
+        [47, 66, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+    ],
+    dtype=np.float64
+)
 
 def get_luminance_quantization_matrix(dtype=np.float64) -> np.ndarray:
     """
@@ -57,6 +70,25 @@ def get_luminance_quantization_matrix(dtype=np.float64) -> np.ndarray:
     """
     return JPEG_LUMINANCE_QUANTIZATION_MATRIX.astype(dtype).copy()
 
+def get_chrominance_quantization_matrix(dtype=np.float64) -> np.ndarray:
+    """
+    Devuelve una copia de la matriz de cuantización de crominancia tipo JPEG.
+
+    Esta matriz se utiliza para las componentes Cb y Cr. En general es más
+    agresiva que la matriz de luminancia, ya que el sistema visual humano es
+    menos sensible a errores de alta frecuencia en crominancia.
+
+    Parameters
+    ----------
+    dtype : data-type
+        Tipo de dato deseado para la matriz devuelta.
+
+    Returns
+    -------
+    q_matrix : np.ndarray
+        Matriz de cuantización de crominancia de tamaño 8x8.
+    """
+    return JPEG_CHROMINANCE_QUANTIZATION_MATRIX.astype(dtype).copy()
 
 def scale_quantization_matrix(
     q_matrix: np.ndarray,
@@ -119,6 +151,79 @@ def scale_quantization_matrix(
 
     return scaled_matrix.astype(dtype)
 
+def get_color_quantization_matrices(
+    scale: float = 1.0,
+    chroma_scale: float | None = None,
+    min_value: int = 1,
+    max_value: int = 255,
+    dtype=np.float64
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Devuelve las matrices de cuantización para una imagen color en YCbCr.
+
+    La componente Y usa la matriz de luminancia, mientras que Cb y Cr usan
+    la matriz de crominancia.
+
+    Parameters
+    ----------
+    scale : float
+        Factor de escala aplicado a la matriz de luminancia.
+
+    chroma_scale : float | None
+        Factor de escala aplicado a las matrices de crominancia.
+        Si es None, se usa el mismo valor que scale.
+
+    min_value : int
+        Valor mínimo permitido para los pasos de cuantización.
+
+    max_value : int
+        Valor máximo permitido para los pasos de cuantización.
+
+    dtype : data-type
+        Tipo de dato de las matrices resultantes.
+
+    Returns
+    -------
+    q_y : np.ndarray
+        Matriz de cuantización para luminancia Y.
+
+    q_cb : np.ndarray
+        Matriz de cuantización para crominancia Cb.
+
+    q_cr : np.ndarray
+        Matriz de cuantización para crominancia Cr.
+    """
+    if chroma_scale is None:
+        chroma_scale = scale
+
+    q_y_base = get_luminance_quantization_matrix(dtype=np.float64)
+    q_c_base = get_chrominance_quantization_matrix(dtype=np.float64)
+
+    q_y = scale_quantization_matrix(
+        q_matrix=q_y_base,
+        scale=scale,
+        min_value=min_value,
+        max_value=max_value,
+        dtype=dtype
+    )
+
+    q_cb = scale_quantization_matrix(
+        q_matrix=q_c_base,
+        scale=chroma_scale,
+        min_value=min_value,
+        max_value=max_value,
+        dtype=dtype
+    )
+
+    q_cr = scale_quantization_matrix(
+        q_matrix=q_c_base,
+        scale=chroma_scale,
+        min_value=min_value,
+        max_value=max_value,
+        dtype=dtype
+    )
+
+    return q_y, q_cb, q_cr
 
 def quality_to_scale(quality: int) -> float:
     """
