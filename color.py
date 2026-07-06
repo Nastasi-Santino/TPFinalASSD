@@ -13,6 +13,7 @@ Implementa:
 """
 
 from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
@@ -458,6 +459,459 @@ def reconstruct_color_channel(
     )
 
     return reconstructed_channel
+
+@dataclass
+class ChromaSubsamplingInfo:
+    """
+    Información necesaria para invertir el submuestreo de crominancia.
+
+    original_shape:
+        Forma original de las componentes Cb y Cr antes del padding.
+
+    padded_shape:
+        Forma luego de agregar padding para que las dimensiones sean pares.
+
+    pad_height:
+        Cantidad de filas agregadas.
+
+    pad_width:
+        Cantidad de columnas agregadas.
+
+    subsampled_shape:
+        Forma de la componente luego del submuestreo 4:2:0.
+
+    mode:
+        Modo de submuestreo utilizado.
+    """
+    original_shape: tuple[int, int]
+    padded_shape: tuple[int, int]
+    pad_height: int
+    pad_width: int
+    subsampled_shape: tuple[int, int]
+    mode: str = "4:2:0"
+
+
+def pad_channel_to_even_shape(channel: np.ndarray) -> tuple[np.ndarray, int, int]:
+    """
+    Agrega padding por replicación de borde para que una componente tenga
+    dimensiones pares.
+
+    Esto es necesario para aplicar submuestreo 4:2:0 mediante bloques 2x2.
+
+    Parameters
+    ----------
+    channel : np.ndarray
+        Componente 2D a completar.
+
+    Returns
+    -------
+    padded_channel : np.ndarray
+        Componente con dimensiones pares.
+
+    pad_height : int
+        Cantidad de filas agregadas.
+
+    pad_width : int
+        Cantidad de columnas agregadas.
+    """
+    channel = np.asarray(channel, dtype=np.float64)
+
+    _validate_channel(channel, name="channel")
+
+    height, width = channel.shape
+
+    pad_height = height % 2
+    pad_width = width % 2
+
+    padded_channel = np.pad(
+        channel,
+        pad_width=((0, pad_height), (0, pad_width)),
+        mode="edge"
+    )
+
+    return padded_channel.astype(np.float64), pad_height, pad_width
+
+
+def downsample_420_channel(channel: np.ndarray) -> tuple[np.ndarray, ChromaSubsamplingInfo]:
+    """
+    Submuestrea una componente de crominancia usando esquema 4:2:0.
+
+    El procedimiento implementado es:
+
+    1. Padding por replicación de borde hasta obtener dimensiones pares.
+    2. Promedio local 2x2.
+    3. Decimación por 2 en ambas dimensiones.
+
+    Matemáticamente, para una componente c[m,n]:
+
+        c_d[p,q] = 1/4 * (
+            c[2p,   2q  ] +
+            c[2p+1, 2q  ] +
+            c[2p,   2q+1] +
+            c[2p+1, 2q+1]
+        )
+
+    Esta operación puede interpretarse como un filtro pasabajos 2x2 seguido
+    de downsampling por 2 en vertical y horizontal.
+
+    Parameters
+    ----------
+    channel : np.ndarray
+        Componente 2D de crominancia, por ejemplo Cb o Cr.
+
+    Returns
+    -------
+    downsampled_channel : np.ndarray
+        Componente submuestreada.
+
+    info : ChromaSubsamplingInfo
+        Información necesaria para reconstruir la forma original.
+    """
+    channel = np.asarray(channel, dtype=np.float64)
+
+    _validate_channel(channel, name="channel")
+
+    original_shape = channel.shape
+
+    padded_channel, pad_height, pad_width = pad_channel_to_even_shape(channel)
+    padded_shape = padded_channel.shape
+
+    downsampled_channel = (
+        padded_channel[0::2, 0::2]
+        + padded_channel[1::2, 0::2]
+        + padded_channel[0::2, 1::2]
+        + padded_channel[1::2, 1::2]
+    ) / 4.0
+
+    info = ChromaSubsamplingInfo(
+        original_shape=original_shape,
+        padded_shape=padded_shape,
+        pad_height=pad_height,
+        pad_width=pad_width,
+        subsampled_shape=downsampled_channel.shape,
+        mode="4:2:0"
+    )
+
+    return downsampled_channel.astype(np.float64), info
+
+
+def downsample_chrominance_420(
+    cb: np.ndarray,
+    cr: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, ChromaSubsamplingInfo]:
+    """
+    Aplica submuestreo 4:2:0 a las componentes Cb y Cr.
+
+    Ambas componentes deben tener la misma forma. Se aplica el mismo criterio
+    de padding y submuestreo a las dos.
+
+    Parameters
+    ----------
+    cb : np.ndarray
+        Componente Cb.
+
+    cr : np.ndarray
+        Componente Cr.
+
+    Returns
+    -------
+    cb_down : np.ndarray
+        Componente Cb submuestreada.
+
+    cr_down : np.ndarray
+        Componente Cr submuestreada.
+
+    info : ChromaSubsamplingInfo
+        Información de submuestreo común a ambas componentes.
+    """
+    cb = np.asarray(cb, dtype=np.float64)
+    cr = np.asarray(cr, dtype=np.float64)
+
+    _validate_channel(cb, name="cb")
+    _validate_channel(cr, name="cr")
+
+    if cb.shape != cr.shape:
+        raise ValueError(
+            "Cb y Cr deben tener la misma forma para aplicar 4:2:0. "
+            f"Cb={cb.shape}, Cr={cr.shape}."
+        )
+
+    cb_down, info_cb = downsample_420_channel(cb)
+    cr_down, info_cr = downsample_420_channel(cr)
+
+    _validate_same_subsampling_info(info_cb, info_cr)
+
+    return cb_down, cr_down, info_cb
+
+
+def resize_channel_bilinear(channel: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    """
+    Redimensiona una componente 2D usando interpolación bilineal.
+
+    Esta función se usa para reconstruir Cb y Cr desde la resolución
+    submuestreada hacia la resolución original.
+
+    Parameters
+    ----------
+    channel : np.ndarray
+        Componente 2D de entrada.
+
+    target_shape : tuple[int, int]
+        Forma deseada:
+        (alto_objetivo, ancho_objetivo)
+
+    Returns
+    -------
+    resized_channel : np.ndarray
+        Componente redimensionada mediante interpolación bilineal.
+    """
+    channel = np.asarray(channel, dtype=np.float64)
+
+    _validate_channel(channel, name="channel")
+    _validate_shape_tuple(target_shape, name="target_shape")
+
+    src_height, src_width = channel.shape
+    target_height, target_width = target_shape
+
+    if src_height == target_height and src_width == target_width:
+        return channel.copy()
+
+    # Mapeo alineado a centros de píxel.
+    # Esto evita asumir que las muestras están ubicadas exactamente en los bordes.
+    row_scale = src_height / target_height
+    col_scale = src_width / target_width
+
+    target_rows = np.arange(target_height)
+    target_cols = np.arange(target_width)
+
+    src_rows = (target_rows + 0.5) * row_scale - 0.5
+    src_cols = (target_cols + 0.5) * col_scale - 0.5
+
+    src_rows = np.clip(src_rows, 0.0, src_height - 1.0)
+    src_cols = np.clip(src_cols, 0.0, src_width - 1.0)
+
+    row0 = np.floor(src_rows).astype(int)
+    col0 = np.floor(src_cols).astype(int)
+
+    row1 = np.clip(row0 + 1, 0, src_height - 1)
+    col1 = np.clip(col0 + 1, 0, src_width - 1)
+
+    row_weight = src_rows - row0
+    col_weight = src_cols - col0
+
+    resized_channel = np.zeros((target_height, target_width), dtype=np.float64)
+
+    for i in range(target_height):
+        r0 = row0[i]
+        r1 = row1[i]
+        wr = row_weight[i]
+
+        top = (
+            (1.0 - col_weight) * channel[r0, col0]
+            + col_weight * channel[r0, col1]
+        )
+
+        bottom = (
+            (1.0 - col_weight) * channel[r1, col0]
+            + col_weight * channel[r1, col1]
+        )
+
+        resized_channel[i, :] = (1.0 - wr) * top + wr * bottom
+
+    return resized_channel
+
+
+def upsample_420_channel_bilinear(
+    downsampled_channel: np.ndarray,
+    info: ChromaSubsamplingInfo
+) -> np.ndarray:
+    """
+    Reconstruye una componente submuestreada 4:2:0 usando interpolación bilineal.
+
+    El procedimiento es:
+
+    1. Interpolar desde la forma submuestreada hasta la forma con padding.
+    2. Recortar el padding para recuperar la forma original.
+
+    Parameters
+    ----------
+    downsampled_channel : np.ndarray
+        Componente submuestreada.
+
+    info : ChromaSubsamplingInfo
+        Información generada durante el submuestreo.
+
+    Returns
+    -------
+    reconstructed_channel : np.ndarray
+        Componente reconstruida a la forma original.
+    """
+    downsampled_channel = np.asarray(downsampled_channel, dtype=np.float64)
+
+    _validate_channel(downsampled_channel, name="downsampled_channel")
+    _validate_chroma_subsampling_info(info)
+
+    if downsampled_channel.shape != info.subsampled_shape:
+        raise ValueError(
+            "La forma de downsampled_channel no coincide con la registrada "
+            "en ChromaSubsamplingInfo. "
+            f"Se recibió {downsampled_channel.shape}, "
+            f"pero se esperaba {info.subsampled_shape}."
+        )
+
+    padded_reconstruction = resize_channel_bilinear(
+        downsampled_channel,
+        target_shape=info.padded_shape
+    )
+
+    original_height, original_width = info.original_shape
+
+    reconstructed_channel = padded_reconstruction[
+        :original_height,
+        :original_width
+    ]
+
+    return reconstructed_channel.astype(np.float64)
+
+
+def upsample_chrominance_420(
+    cb_down: np.ndarray,
+    cr_down: np.ndarray,
+    info: ChromaSubsamplingInfo
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reconstruye las componentes Cb y Cr desde submuestreo 4:2:0.
+
+    Parameters
+    ----------
+    cb_down : np.ndarray
+        Componente Cb submuestreada.
+
+    cr_down : np.ndarray
+        Componente Cr submuestreada.
+
+    info : ChromaSubsamplingInfo
+        Información de submuestreo.
+
+    Returns
+    -------
+    cb_up : np.ndarray
+        Componente Cb reconstruida a resolución completa.
+
+    cr_up : np.ndarray
+        Componente Cr reconstruida a resolución completa.
+    """
+    cb_down = np.asarray(cb_down, dtype=np.float64)
+    cr_down = np.asarray(cr_down, dtype=np.float64)
+
+    _validate_channel(cb_down, name="cb_down")
+    _validate_channel(cr_down, name="cr_down")
+
+    if cb_down.shape != cr_down.shape:
+        raise ValueError(
+            "Cb_down y Cr_down deben tener la misma forma. "
+            f"Cb_down={cb_down.shape}, Cr_down={cr_down.shape}."
+        )
+
+    cb_up = upsample_420_channel_bilinear(cb_down, info)
+    cr_up = upsample_420_channel_bilinear(cr_down, info)
+
+    return cb_up, cr_up
+
+
+def _validate_shape_tuple(shape: tuple[int, int], name: str = "shape") -> None:
+    """
+    Valida una tupla de forma 2D.
+
+    Parameters
+    ----------
+    shape : tuple[int, int]
+        Tupla esperada:
+        (alto, ancho)
+
+    name : str
+        Nombre descriptivo para mensajes de error.
+    """
+    if not isinstance(shape, tuple):
+        raise TypeError(f"{name} debe ser una tupla.")
+
+    if len(shape) != 2:
+        raise ValueError(f"{name} debe tener longitud 2: (alto, ancho).")
+
+    height, width = shape
+
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Las dimensiones de {name} deben ser positivas.")
+
+
+def _validate_chroma_subsampling_info(info: ChromaSubsamplingInfo) -> None:
+    """
+    Valida un objeto ChromaSubsamplingInfo.
+
+    Parameters
+    ----------
+    info : ChromaSubsamplingInfo
+        Información de submuestreo.
+    """
+    if not isinstance(info, ChromaSubsamplingInfo):
+        raise TypeError("info debe ser una instancia de ChromaSubsamplingInfo.")
+
+    _validate_shape_tuple(info.original_shape, name="info.original_shape")
+    _validate_shape_tuple(info.padded_shape, name="info.padded_shape")
+    _validate_shape_tuple(info.subsampled_shape, name="info.subsampled_shape")
+
+    original_height, original_width = info.original_shape
+    padded_height, padded_width = info.padded_shape
+    subsampled_height, subsampled_width = info.subsampled_shape
+
+    if padded_height < original_height or padded_width < original_width:
+        raise ValueError(
+            "La forma con padding no puede ser menor que la forma original."
+        )
+
+    if info.pad_height < 0 or info.pad_width < 0:
+        raise ValueError("Los valores de padding no pueden ser negativos.")
+
+    if padded_height % 2 != 0 or padded_width % 2 != 0:
+        raise ValueError(
+            "La forma con padding debe tener dimensiones pares para 4:2:0."
+        )
+
+    expected_subsampled_shape = (padded_height // 2, padded_width // 2)
+
+    if info.subsampled_shape != expected_subsampled_shape:
+        raise ValueError(
+            "La forma submuestreada no es consistente con la forma con padding. "
+            f"Se esperaba {expected_subsampled_shape}, "
+            f"pero se recibió {info.subsampled_shape}."
+        )
+
+    if subsampled_height <= 0 or subsampled_width <= 0:
+        raise ValueError("La forma submuestreada debe tener dimensiones positivas.")
+
+    if info.mode != "4:2:0":
+        raise ValueError(
+            f"Modo de submuestreo no soportado: {info.mode}. "
+            "Actualmente solo se soporta '4:2:0'."
+        )
+
+
+def _validate_same_subsampling_info(
+    info_a: ChromaSubsamplingInfo,
+    info_b: ChromaSubsamplingInfo
+) -> None:
+    """
+    Verifica que dos objetos ChromaSubsamplingInfo sean compatibles.
+
+    Se usa para asegurar que Cb y Cr fueron submuestreadas de la misma forma.
+    """
+    _validate_chroma_subsampling_info(info_a)
+    _validate_chroma_subsampling_info(info_b)
+
+    if info_a != info_b:
+        raise ValueError(
+            "Las componentes Cb y Cr no tienen información de submuestreo compatible."
+        )
 
 if __name__ == "__main__":
     # Prueba simple de ida y vuelta RGB -> YCbCr -> RGB.

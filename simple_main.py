@@ -8,6 +8,8 @@ from color import (
     merge_ycbcr_channels,
     compress_color_channel,
     reconstruct_color_channel,
+    downsample_chrominance_420,
+    upsample_chrominance_420,
     save_rgb_image,
 )
 
@@ -29,6 +31,8 @@ original_rgb = load_image(image_path)
 
 original_ycbcr = rgb_to_ycbcr(original_rgb)
 y, cb, cr = split_ycbcr_channels(original_ycbcr)
+
+cb_down, cr_down, chroma_info = downsample_chrominance_420(cb, cr)
 
 # ============================================================
 # Matrices DCT y cuantización
@@ -52,14 +56,14 @@ encoded_y, quantized_y, info_y = compress_color_channel(
 )
 
 encoded_cb, quantized_cb, info_cb = compress_color_channel(
-    cb,
+    cb_down,
     q_matrix=q_cb,
     dct_matrix=C,
     block_size=block_size
 )
 
 encoded_cr, quantized_cr, info_cr = compress_color_channel(
-    cr,
+    cr_down,
     q_matrix=q_cr,
     dct_matrix=C,
     block_size=block_size
@@ -77,7 +81,7 @@ reconstructed_y = reconstruct_color_channel(
     dct_matrix=C
 )
 
-reconstructed_cb = reconstruct_color_channel(
+reconstructed_cb_down = reconstruct_color_channel(
     encoded_cb,
     blocks_shape=quantized_cb.shape,
     q_matrix=q_cb,
@@ -85,7 +89,7 @@ reconstructed_cb = reconstruct_color_channel(
     dct_matrix=C
 )
 
-reconstructed_cr = reconstruct_color_channel(
+reconstructed_cr_down = reconstruct_color_channel(
     encoded_cr,
     blocks_shape=quantized_cr.shape,
     q_matrix=q_cr,
@@ -96,6 +100,12 @@ reconstructed_cr = reconstruct_color_channel(
 # ============================================================
 # Unión YCbCr y conversión a RGB
 # ============================================================
+
+reconstructed_cb, reconstructed_cr = upsample_chrominance_420(
+    reconstructed_cb_down,
+    reconstructed_cr_down,
+    chroma_info
+)
 
 reconstructed_ycbcr = merge_ycbcr_channels(
     reconstructed_y,
