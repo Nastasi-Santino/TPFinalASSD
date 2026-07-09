@@ -1,6 +1,6 @@
 from preprocessing import load_image
 from dct import create_dct_matrix
-from quantization import get_color_quantization_matrices
+from quantization import get_color_quantization_matrices, print_block_class_summary
 from color import (
     rgb_to_ycbcr,
     ycbcr_to_rgb,
@@ -8,6 +8,8 @@ from color import (
     merge_ycbcr_channels,
     compress_color_channel,
     reconstruct_color_channel,
+    compress_color_channel_adaptive,
+    reconstruct_color_channel_adaptive,
     downsample_chrominance_420,
     upsample_chrominance_420,
     save_rgb_image,
@@ -49,12 +51,18 @@ q_y, q_cb, q_cr = get_color_quantization_matrices(
 # Compresión por componente
 # ============================================================
 
-encoded_y, quantized_y, info_y = compress_color_channel(
+encoded_y, quantized_y, info_y, class_map_y, scale_map_y = compress_color_channel_adaptive(
     y,
     q_matrix=q_y,
     dct_matrix=C,
-    block_size=block_size
+    block_size=block_size,
+    smooth_scale=1.5,
+    edge_scale=0.75,
+    texture_scale=1.0
 )
+
+print()
+print_block_class_summary(class_map_y)
 
 encoded_cb, quantized_cb, info_cb = compress_color_channel(
     cb_down,
@@ -90,12 +98,13 @@ print_huffman_summary(huffman_cr)
 # Reconstrucción por componente
 # ============================================================
 
-reconstructed_y = reconstruct_color_channel(
+reconstructed_y = reconstruct_color_channel_adaptive(
     encoded_y,
     blocks_shape=quantized_y.shape,
     q_matrix=q_y,
     info=info_y,
-    dct_matrix=C
+    dct_matrix=C,
+    scale_map=scale_map_y
 )
 
 reconstructed_cb_down = reconstruct_color_channel(

@@ -272,7 +272,14 @@ from preprocessing import (
 )
 
 from dct import dct2_blocks, idct2_blocks
-from quantization import quantize_blocks, dequantize_blocks
+from quantization import (
+    quantize_blocks,
+    dequantize_blocks,
+    classify_blocks_by_content,
+    create_scale_map_from_class_map,
+    quantize_blocks_adaptive,
+    dequantize_blocks_adaptive,
+)
 from coding import encode_quantized_blocks, decode_quantized_blocks
 from reconstruction import reconstruct_from_blocks
 
@@ -446,6 +453,216 @@ def reconstruct_color_channel(
     dequantized_blocks = dequantize_blocks(
         quantized_blocks,
         q_matrix=q_matrix
+    )
+
+    reconstructed_shifted_blocks = idct2_blocks(
+        dequantized_blocks,
+        dct_matrix=dct_matrix
+    )
+
+    reconstructed_channel = reconstruct_from_blocks(
+        reconstructed_shifted_blocks,
+        info
+    )
+
+    return reconstructed_channel
+
+
+def compress_color_channel_adaptive(
+    channel: np.ndarray,
+    q_matrix: np.ndarray,
+    dct_matrix: np.ndarray,
+    block_size: int = 8,
+    smooth_scale: float = 1.5,
+    edge_scale: float = 0.75,
+    texture_scale: float = 1.0,
+    variance_threshold: float | None = None,
+    gradient_threshold: float | None = None,
+    directionality_threshold: float = 0.35
+) -> tuple[list, np.ndarray, PreprocessingInfo, np.ndarray, np.ndarray]:
+    """
+    Comprime una componente 2D usando cuantización adaptativa por bloque.
+
+    Esta función está pensada principalmente para la componente de luminancia Y.
+
+    Realiza:
+    1. padding por replicación de borde;
+    2. división en bloques espaciales;
+    3. clasificación local de bloques;
+    4. creación del mapa de escalas;
+    5. level shift;
+    6. DCT;
+    7. cuantización adaptativa;
+    8. codificación zig-zag, DC diferencial y RLE.
+
+    Parameters
+    ----------
+    channel : np.ndarray
+        Componente 2D a comprimir.
+
+    q_matrix : np.ndarray
+        Matriz de cuantización base.
+
+    dct_matrix : np.ndarray
+        Matriz DCT.
+
+    block_size : int
+        Tamaño de bloque.
+
+    smooth_scale : float
+        Factor de cuantización para bloques suaves.
+        Valores mayores a 1 cuantizan más fuerte.
+
+    edge_scale : float
+        Factor de cuantización para bloques con bordes.
+        Valores menores a 1 conservan más coeficientes.
+
+    texture_scale : float
+        Factor de cuantización para bloques con textura.
+
+    variance_threshold : float | None
+        Umbral manual de varianza. Si es None, se estima automáticamente.
+
+    gradient_threshold : float | None
+        Umbral manual de energía de gradiente. Si es None, se estima automáticamente.
+
+    directionality_threshold : float
+        Umbral de direccionalidad para distinguir bordes de texturas.
+
+    Returns
+    -------
+    encoded_blocks : list
+        Bloques codificados.
+
+    quantized_blocks : np.ndarray
+        Bloques cuantizados.
+
+    info : PreprocessingInfo
+        Información necesaria para reconstrucción.
+
+    class_map : np.ndarray
+        Mapa de clases de bloque.
+
+    scale_map : np.ndarray
+        Mapa de factores de cuantización por bloque.
+    """
+    channel = np.asarray(channel, dtype=np.float64)
+
+    _validate_channel(channel, name="channel")
+
+    original_shape = channel.shape
+
+    padded_channel, pad_height, pad_width = pad_image_edge(
+        channel,
+        block_size=block_size
+    )
+
+    padded_shape = padded_channel.shape
+
+    spatial_blocks = split_into_blocks(
+        padded_channel,
+        block_size=block_size
+    )
+
+    class_map = classify_blocks_by_content(
+        spatial_blocks,
+        variance_threshold=variance_threshold,
+        gradient_threshold=gradient_threshold,
+        directionality_threshold=directionality_threshold,
+        return_features=False
+    )
+
+    scale_map = create_scale_map_from_class_map(
+        class_map,
+        smooth_scale=smooth_scale,
+        edge_scale=edge_scale,
+        texture_scale=texture_scale
+    )
+
+    shifted_blocks = level_shift_blocks(
+        spatial_blocks,
+        shift=128.0
+    )
+
+    info = PreprocessingInfo(
+        original_shape=original_shape,
+        padded_shape=padded_shape,
+        pad_height=pad_height,
+        pad_width=pad_width,
+        block_size=block_size
+    )
+
+    coeff_blocks = dct2_blocks(
+        shifted_blocks,
+        dct_matrix=dct_matrix
+    )
+
+    quantized_blocks = quantize_blocks_adaptive(
+        coeff_blocks,
+        q_matrix=q_matrix,
+        scale_map=scale_map
+    )
+
+    encoded_blocks = encode_quantized_blocks(
+        quantized_blocks
+    )
+
+    return encoded_blocks, quantized_blocks, info, class_map, scale_map
+
+
+def reconstruct_color_channel_adaptive(
+    encoded_blocks: list,
+    blocks_shape: tuple[int, int, int, int],
+    q_matrix: np.ndarray,
+    info: PreprocessingInfo,
+    dct_matrix: np.ndarray,
+    scale_map: np.ndarray
+) -> np.ndarray:
+    """
+    Reconstruye una componente 2D comprimida con cuantización adaptativa.
+
+    Realiza:
+    1. decodificación simbólica;
+    2. de-cuantización adaptativa usando el mismo mapa de escalas;
+    3. IDCT;
+    4. inverse level shift;
+    5. reensamblado;
+    6. crop.
+
+    Parameters
+    ----------
+    encoded_blocks : list
+        Bloques codificados.
+
+    blocks_shape : tuple[int, int, int, int]
+        Forma del arreglo de bloques cuantizados.
+
+    q_matrix : np.ndarray
+        Matriz de cuantización base.
+
+    info : PreprocessingInfo
+        Información de preprocesamiento.
+
+    dct_matrix : np.ndarray
+        Matriz DCT.
+
+    scale_map : np.ndarray
+        Mapa de factores de cuantización usado durante la compresión.
+
+    Returns
+    -------
+    reconstructed_channel : np.ndarray
+        Componente reconstruida.
+    """
+    quantized_blocks = decode_quantized_blocks(
+        encoded_blocks=encoded_blocks,
+        blocks_shape=blocks_shape
+    )
+
+    dequantized_blocks = dequantize_blocks_adaptive(
+        quantized_blocks,
+        q_matrix=q_matrix,
+        scale_map=scale_map
     )
 
     reconstructed_shifted_blocks = idct2_blocks(

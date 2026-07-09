@@ -458,6 +458,609 @@ def dequantize_blocks(quantized_blocks: np.ndarray, q_matrix: np.ndarray) -> np.
     return dequantized_blocks
 
 
+
+# ============================================================
+# Cuantización adaptativa por bloque
+# ============================================================
+
+SMOOTH_BLOCK = 0
+EDGE_BLOCK = 1
+TEXTURE_BLOCK = 2
+
+BLOCK_CLASS_NAMES = {
+    SMOOTH_BLOCK: "smooth",
+    EDGE_BLOCK: "edge",
+    TEXTURE_BLOCK: "texture",
+}
+
+DEFAULT_SMOOTH_SCALE = 1.5
+DEFAULT_EDGE_SCALE = 0.75
+DEFAULT_TEXTURE_SCALE = 1.0
+
+SOBEL_X_KERNEL = np.array(
+    [
+        [-1, 0, 1],
+        [-2, 0, 2],
+        [-1, 0, 1],
+    ],
+    dtype=np.float64
+)
+
+SOBEL_Y_KERNEL = np.array(
+    [
+        [-1, -2, -1],
+        [0, 0, 0],
+        [1, 2, 1],
+    ],
+    dtype=np.float64
+)
+
+
+def convolve2d_same_edge(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """
+    Aplica una convolución 2D con padding por replicación de borde.
+
+    Esta función se usa para implementar filtros FIR 2D simples, como Sobel,
+    sin depender de librerías externas.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Imagen 2D de entrada.
+
+    kernel : np.ndarray
+        Kernel FIR 2D.
+
+    Returns
+    -------
+    output : np.ndarray
+        Imagen filtrada con la misma forma que la entrada.
+    """
+    image = np.asarray(image, dtype=np.float64)
+    kernel = np.asarray(kernel, dtype=np.float64)
+
+    _validate_block(image, name="image")
+
+    if kernel.ndim != 2:
+        raise ValueError("kernel debe ser una matriz 2D.")
+
+    kernel_height, kernel_width = kernel.shape
+
+    if kernel_height <= 0 or kernel_width <= 0:
+        raise ValueError("kernel debe tener dimensiones positivas.")
+
+    pad_h = kernel_height // 2
+    pad_w = kernel_width // 2
+
+    padded = np.pad(
+        image,
+        pad_width=((pad_h, pad_h), (pad_w, pad_w)),
+        mode="edge"
+    )
+
+    output = np.zeros_like(image, dtype=np.float64)
+
+    # Convolución: se invierte el kernel en ambas dimensiones.
+    flipped_kernel = np.flipud(np.fliplr(kernel))
+
+    for i in range(image.shape[0]):
+        for j in range(image.shape[1]):
+            region = padded[i:i + kernel_height, j:j + kernel_width]
+            output[i, j] = np.sum(region * flipped_kernel)
+
+    return output
+
+
+def compute_block_features(block: np.ndarray, epsilon: float = 1e-12) -> dict[str, float]:
+    """
+    Calcula características espaciales de un bloque.
+
+    Las características calculadas son:
+    - media;
+    - varianza;
+    - energía de gradiente horizontal;
+    - energía de gradiente vertical;
+    - energía total de gradiente;
+    - direccionalidad.
+
+    Parameters
+    ----------
+    block : np.ndarray
+        Bloque espacial 2D, típicamente de tamaño 8x8.
+
+    epsilon : float
+        Constante pequeña para evitar divisiones por cero.
+
+    Returns
+    -------
+    features : dict[str, float]
+        Diccionario con las características del bloque.
+    """
+    block = np.asarray(block, dtype=np.float64)
+
+    _validate_block(block, name="block")
+
+    if epsilon <= 0:
+        raise ValueError("epsilon debe ser positivo.")
+
+    mean_value = float(np.mean(block))
+    variance = float(np.var(block))
+
+    gx = convolve2d_same_edge(block, SOBEL_X_KERNEL)
+    gy = convolve2d_same_edge(block, SOBEL_Y_KERNEL)
+
+    gradient_energy_x = float(np.mean(gx ** 2))
+    gradient_energy_y = float(np.mean(gy ** 2))
+    gradient_energy = gradient_energy_x + gradient_energy_y
+
+    directionality = abs(gradient_energy_x - gradient_energy_y) / (
+        gradient_energy + epsilon
+    )
+
+    return {
+        "mean": mean_value,
+        "variance": variance,
+        "gradient_energy_x": gradient_energy_x,
+        "gradient_energy_y": gradient_energy_y,
+        "gradient_energy": gradient_energy,
+        "directionality": float(directionality),
+    }
+
+
+def compute_blocks_features(blocks: np.ndarray) -> dict[str, np.ndarray]:
+    """
+    Calcula características espaciales para un arreglo de bloques.
+
+    Parameters
+    ----------
+    blocks : np.ndarray
+        Arreglo de bloques con forma:
+        (num_bloques_vertical, num_bloques_horizontal, N, N)
+
+    Returns
+    -------
+    features : dict[str, np.ndarray]
+        Diccionario con mapas 2D de características.
+    """
+    blocks = np.asarray(blocks, dtype=np.float64)
+
+    _validate_blocks_array(blocks, name="blocks")
+
+    num_blocks_h, num_blocks_w, _, _ = blocks.shape
+
+    means = np.zeros((num_blocks_h, num_blocks_w), dtype=np.float64)
+    variances = np.zeros((num_blocks_h, num_blocks_w), dtype=np.float64)
+    gradient_energy_x = np.zeros((num_blocks_h, num_blocks_w), dtype=np.float64)
+    gradient_energy_y = np.zeros((num_blocks_h, num_blocks_w), dtype=np.float64)
+    gradient_energy = np.zeros((num_blocks_h, num_blocks_w), dtype=np.float64)
+    directionality = np.zeros((num_blocks_h, num_blocks_w), dtype=np.float64)
+
+    for i in range(num_blocks_h):
+        for j in range(num_blocks_w):
+            block_features = compute_block_features(blocks[i, j])
+
+            means[i, j] = block_features["mean"]
+            variances[i, j] = block_features["variance"]
+            gradient_energy_x[i, j] = block_features["gradient_energy_x"]
+            gradient_energy_y[i, j] = block_features["gradient_energy_y"]
+            gradient_energy[i, j] = block_features["gradient_energy"]
+            directionality[i, j] = block_features["directionality"]
+
+    return {
+        "mean": means,
+        "variance": variances,
+        "gradient_energy_x": gradient_energy_x,
+        "gradient_energy_y": gradient_energy_y,
+        "gradient_energy": gradient_energy,
+        "directionality": directionality,
+    }
+
+
+def classify_blocks_by_content(
+    spatial_blocks: np.ndarray,
+    variance_threshold: float | None = None,
+    gradient_threshold: float | None = None,
+    directionality_threshold: float = 0.35,
+    smooth_variance_percentile: float = 35.0,
+    gradient_percentile: float = 55.0,
+    return_features: bool = False
+) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
+    """
+    Clasifica bloques espaciales como suaves, con bordes o con textura.
+
+    La clasificación se basa en:
+    - varianza local;
+    - energía de gradiente;
+    - direccionalidad del gradiente.
+
+    Parameters
+    ----------
+    spatial_blocks : np.ndarray
+        Bloques espaciales antes de aplicar level shift y DCT.
+        Forma:
+        (num_bloques_vertical, num_bloques_horizontal, N, N)
+
+    variance_threshold : float | None
+        Umbral de varianza para detectar bloques suaves. Si es None,
+        se estima automáticamente con un percentil.
+
+    gradient_threshold : float | None
+        Umbral de energía de gradiente. Si es None, se estima automáticamente
+        con un percentil.
+
+    directionality_threshold : float
+        Umbral de direccionalidad para distinguir bordes de texturas.
+
+    smooth_variance_percentile : float
+        Percentil usado para estimar variance_threshold si no se provee.
+
+    gradient_percentile : float
+        Percentil usado para estimar gradient_threshold si no se provee.
+
+    return_features : bool
+        Si es True, devuelve también los mapas de características.
+
+    Returns
+    -------
+    class_map : np.ndarray
+        Mapa 2D de clases:
+        0 -> bloque suave,
+        1 -> bloque con borde,
+        2 -> bloque con textura.
+
+    features : dict[str, np.ndarray]
+        Solo si return_features=True. Mapas de características por bloque.
+    """
+    spatial_blocks = np.asarray(spatial_blocks, dtype=np.float64)
+
+    _validate_blocks_array(spatial_blocks, name="spatial_blocks")
+
+    if not (0.0 <= directionality_threshold <= 1.0):
+        raise ValueError("directionality_threshold debe estar entre 0 y 1.")
+
+    _validate_percentile(smooth_variance_percentile, "smooth_variance_percentile")
+    _validate_percentile(gradient_percentile, "gradient_percentile")
+
+    features = compute_blocks_features(spatial_blocks)
+
+    variance_map = features["variance"]
+    gradient_map = features["gradient_energy"]
+    directionality_map = features["directionality"]
+
+    if variance_threshold is None:
+        variance_threshold = float(np.percentile(variance_map, smooth_variance_percentile))
+
+    if gradient_threshold is None:
+        gradient_threshold = float(np.percentile(gradient_map, gradient_percentile))
+
+    if variance_threshold < 0:
+        raise ValueError("variance_threshold no puede ser negativo.")
+
+    if gradient_threshold < 0:
+        raise ValueError("gradient_threshold no puede ser negativo.")
+
+    class_map = np.full(variance_map.shape, TEXTURE_BLOCK, dtype=np.int32)
+
+    smooth_mask = (
+        (variance_map <= variance_threshold)
+        & (gradient_map <= gradient_threshold)
+    )
+
+    edge_mask = (
+        (gradient_map > gradient_threshold)
+        & (directionality_map >= directionality_threshold)
+    )
+
+    class_map[smooth_mask] = SMOOTH_BLOCK
+    class_map[edge_mask] = EDGE_BLOCK
+
+    # Todo lo que no sea suave ni borde queda como textura.
+    class_map[(~smooth_mask) & (~edge_mask)] = TEXTURE_BLOCK
+
+    if return_features:
+        return class_map, features
+
+    return class_map
+
+
+def create_scale_map_from_class_map(
+    class_map: np.ndarray,
+    smooth_scale: float = DEFAULT_SMOOTH_SCALE,
+    edge_scale: float = DEFAULT_EDGE_SCALE,
+    texture_scale: float = DEFAULT_TEXTURE_SCALE
+) -> np.ndarray:
+    """
+    Convierte un mapa de clases en un mapa de factores de cuantización.
+
+    Parameters
+    ----------
+    class_map : np.ndarray
+        Mapa 2D de clases de bloque.
+
+    smooth_scale : float
+        Factor para bloques suaves. Debe ser mayor que 1 para cuantizar
+        más agresivamente.
+
+    edge_scale : float
+        Factor para bloques con bordes. Debe ser menor que 1 para conservar
+        más coeficientes.
+
+    texture_scale : float
+        Factor para bloques con textura.
+
+    Returns
+    -------
+    scale_map : np.ndarray
+        Mapa 2D de factores de escala.
+    """
+    class_map = np.asarray(class_map, dtype=np.int32)
+
+    _validate_class_map(class_map)
+
+    _validate_positive_scale(smooth_scale, "smooth_scale")
+    _validate_positive_scale(edge_scale, "edge_scale")
+    _validate_positive_scale(texture_scale, "texture_scale")
+
+    scale_map = np.zeros(class_map.shape, dtype=np.float64)
+
+    scale_map[class_map == SMOOTH_BLOCK] = smooth_scale
+    scale_map[class_map == EDGE_BLOCK] = edge_scale
+    scale_map[class_map == TEXTURE_BLOCK] = texture_scale
+
+    return scale_map
+
+
+def create_adaptive_quantization_matrices(
+    q_matrix: np.ndarray,
+    scale_map: np.ndarray,
+    min_value: int = 1,
+    max_value: int = 255
+) -> np.ndarray:
+    """
+    Crea una matriz de cuantización efectiva por bloque.
+
+    Parameters
+    ----------
+    q_matrix : np.ndarray
+        Matriz de cuantización base de forma (N, N).
+
+    scale_map : np.ndarray
+        Mapa 2D de factores con forma
+        (num_bloques_vertical, num_bloques_horizontal).
+
+    min_value : int
+        Valor mínimo permitido.
+
+    max_value : int
+        Valor máximo permitido.
+
+    Returns
+    -------
+    adaptive_q_matrices : np.ndarray
+        Matrices de cuantización por bloque con forma:
+        (num_bloques_vertical, num_bloques_horizontal, N, N)
+    """
+    q_matrix = np.asarray(q_matrix, dtype=np.float64)
+    scale_map = np.asarray(scale_map, dtype=np.float64)
+
+    _validate_quantization_matrix(q_matrix)
+    _validate_scale_map(scale_map)
+
+    if min_value <= 0:
+        raise ValueError("min_value debe ser positivo.")
+
+    if max_value < min_value:
+        raise ValueError("max_value debe ser mayor o igual que min_value.")
+
+    adaptive_q_matrices = scale_map[:, :, None, None] * q_matrix[None, None, :, :]
+    adaptive_q_matrices = np.rint(adaptive_q_matrices)
+    adaptive_q_matrices = np.clip(adaptive_q_matrices, min_value, max_value)
+
+    return adaptive_q_matrices.astype(np.float64)
+
+
+def quantize_blocks_adaptive(
+    coeff_blocks: np.ndarray,
+    q_matrix: np.ndarray,
+    scale_map: np.ndarray,
+    min_value: int = 1,
+    max_value: int = 255
+) -> np.ndarray:
+    """
+    Cuantiza bloques DCT usando un factor de escala distinto por bloque.
+
+    Parameters
+    ----------
+    coeff_blocks : np.ndarray
+        Bloques de coeficientes DCT con forma:
+        (num_bloques_vertical, num_bloques_horizontal, N, N)
+
+    q_matrix : np.ndarray
+        Matriz de cuantización base.
+
+    scale_map : np.ndarray
+        Mapa 2D de factores de escala.
+
+    min_value : int
+        Valor mínimo permitido para la matriz efectiva.
+
+    max_value : int
+        Valor máximo permitido para la matriz efectiva.
+
+    Returns
+    -------
+    quantized_blocks : np.ndarray
+        Bloques cuantizados.
+    """
+    coeff_blocks = np.asarray(coeff_blocks, dtype=np.float64)
+    q_matrix = np.asarray(q_matrix, dtype=np.float64)
+    scale_map = np.asarray(scale_map, dtype=np.float64)
+
+    _validate_blocks_array(coeff_blocks, name="coeff_blocks")
+    _validate_quantization_matrix(q_matrix, expected_size=coeff_blocks.shape[2])
+    _validate_scale_map_for_blocks(scale_map, coeff_blocks)
+
+    adaptive_q = create_adaptive_quantization_matrices(
+        q_matrix=q_matrix,
+        scale_map=scale_map,
+        min_value=min_value,
+        max_value=max_value
+    )
+
+    quantized_blocks = np.rint(coeff_blocks / adaptive_q)
+
+    return quantized_blocks.astype(np.int32)
+
+
+def dequantize_blocks_adaptive(
+    quantized_blocks: np.ndarray,
+    q_matrix: np.ndarray,
+    scale_map: np.ndarray,
+    min_value: int = 1,
+    max_value: int = 255
+) -> np.ndarray:
+    """
+    De-cuantiza bloques usando el mismo mapa de escalas adaptativo.
+
+    Parameters
+    ----------
+    quantized_blocks : np.ndarray
+        Bloques cuantizados.
+
+    q_matrix : np.ndarray
+        Matriz de cuantización base.
+
+    scale_map : np.ndarray
+        Mapa 2D de factores de escala usado en la cuantización.
+
+    min_value : int
+        Valor mínimo permitido para la matriz efectiva.
+
+    max_value : int
+        Valor máximo permitido para la matriz efectiva.
+
+    Returns
+    -------
+    dequantized_blocks : np.ndarray
+        Bloques de-cuantizados.
+    """
+    quantized_blocks = np.asarray(quantized_blocks)
+    q_matrix = np.asarray(q_matrix, dtype=np.float64)
+    scale_map = np.asarray(scale_map, dtype=np.float64)
+
+    _validate_blocks_array(quantized_blocks, name="quantized_blocks")
+    _validate_quantization_matrix(q_matrix, expected_size=quantized_blocks.shape[2])
+    _validate_scale_map_for_blocks(scale_map, quantized_blocks)
+
+    adaptive_q = create_adaptive_quantization_matrices(
+        q_matrix=q_matrix,
+        scale_map=scale_map,
+        min_value=min_value,
+        max_value=max_value
+    )
+
+    return quantized_blocks.astype(np.float64) * adaptive_q
+
+
+def count_block_classes(class_map: np.ndarray) -> dict[str, int]:
+    """
+    Cuenta cuántos bloques hay de cada clase.
+
+    Parameters
+    ----------
+    class_map : np.ndarray
+        Mapa de clases.
+
+    Returns
+    -------
+    counts : dict[str, int]
+        Cantidad de bloques suaves, con bordes y con textura.
+    """
+    class_map = np.asarray(class_map, dtype=np.int32)
+
+    _validate_class_map(class_map)
+
+    return {
+        "smooth": int(np.count_nonzero(class_map == SMOOTH_BLOCK)),
+        "edge": int(np.count_nonzero(class_map == EDGE_BLOCK)),
+        "texture": int(np.count_nonzero(class_map == TEXTURE_BLOCK)),
+    }
+
+
+def print_block_class_summary(class_map: np.ndarray) -> None:
+    """
+    Imprime un resumen del mapa de clases de bloques.
+    """
+    counts = count_block_classes(class_map)
+    total = sum(counts.values())
+
+    print("Clasificación adaptativa de bloques")
+    print("-----------------------------------")
+
+    for class_name in ("smooth", "edge", "texture"):
+        count = counts[class_name]
+        percentage = 100.0 * count / total if total > 0 else 0.0
+        print(f"{class_name:>8}: {count:5d} bloques ({percentage:6.2f}%)")
+
+
+def _validate_percentile(value: float, name: str) -> None:
+    """
+    Valida un percentil.
+    """
+    if not (0.0 <= value <= 100.0):
+        raise ValueError(f"{name} debe estar entre 0 y 100.")
+
+
+def _validate_positive_scale(scale: float, name: str) -> None:
+    """
+    Valida un factor de escala positivo.
+    """
+    if scale <= 0:
+        raise ValueError(f"{name} debe ser positivo.")
+
+
+def _validate_class_map(class_map: np.ndarray) -> None:
+    """
+    Valida un mapa de clases de bloque.
+    """
+    if class_map.ndim != 2:
+        raise ValueError("class_map debe ser una matriz 2D.")
+
+    valid_classes = {SMOOTH_BLOCK, EDGE_BLOCK, TEXTURE_BLOCK}
+    observed_classes = set(np.unique(class_map).tolist())
+
+    if not observed_classes.issubset(valid_classes):
+        raise ValueError(
+            f"class_map contiene clases inválidas: {observed_classes}. "
+            f"Clases válidas: {valid_classes}."
+        )
+
+
+def _validate_scale_map(scale_map: np.ndarray) -> None:
+    """
+    Valida un mapa de factores de escala.
+    """
+    if scale_map.ndim != 2:
+        raise ValueError("scale_map debe ser una matriz 2D.")
+
+    if np.any(scale_map <= 0):
+        raise ValueError("Todos los factores de scale_map deben ser positivos.")
+
+
+def _validate_scale_map_for_blocks(scale_map: np.ndarray, blocks: np.ndarray) -> None:
+    """
+    Valida que un scale_map sea compatible con un arreglo de bloques.
+    """
+    _validate_scale_map(scale_map)
+
+    expected_shape = blocks.shape[:2]
+
+    if scale_map.shape != expected_shape:
+        raise ValueError(
+            "scale_map debe tener la misma cantidad de bloques que blocks. "
+            f"Se esperaba {expected_shape}, pero se recibió {scale_map.shape}."
+        )
+
 def count_zero_coefficients(quantized_blocks: np.ndarray) -> int:
     """
     Cuenta la cantidad total de coeficientes nulos en un arreglo de bloques cuantizados.
