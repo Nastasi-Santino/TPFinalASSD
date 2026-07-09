@@ -12,6 +12,7 @@ from color import (
     upsample_chrominance_420,
     save_rgb_image,
 )
+from coding import huffman_encode_encoded_blocks, print_huffman_summary
 
 # ============================================================
 # Parámetros
@@ -68,6 +69,22 @@ encoded_cr, quantized_cr, info_cr = compress_color_channel(
     dct_matrix=C,
     block_size=block_size
 )
+
+huffman_y = huffman_encode_encoded_blocks(encoded_y)
+huffman_cb = huffman_encode_encoded_blocks(encoded_cb)
+huffman_cr = huffman_encode_encoded_blocks(encoded_cr)
+
+print()
+print("Huffman Y")
+print_huffman_summary(huffman_y)
+
+print()
+print("Huffman Cb")
+print_huffman_summary(huffman_cb)
+
+print()
+print("Huffman Cr")
+print_huffman_summary(huffman_cr)
 
 # ============================================================
 # Reconstrucción por componente
