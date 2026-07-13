@@ -10,8 +10,6 @@ coeficientes con una matriz configurable, los codifica simbólicamente
 (zig-zag + DC diferencial + RLE) y reconstruye la imagen a partir de esa
 representación, evaluando la calidad y la compresión obtenidas.
 
-> Este README fue armado a partir del informe (`ASSDTP4_Grupo1.pdf`) y del
-> código fuente, ya que el repo no tenía documentación propia.
 
 ---
 
@@ -339,10 +337,6 @@ del informe. Genera `.png` y `.pdf` con `matplotlib`.
 - Bits estimados de la imagen original vs. la representación comprimida
 - Relación de compresión (`CR`) y porcentaje de reducción
 
-> El informe también menciona **SSIM** (sección 7.7) como métrica
-> complementaria de similitud estructural, pero **no está implementada** en
-> el código (`metrics.py` no tiene función SSIM).
-
 ---
 
 ## Notas conceptuales clave (resumen del informe)
@@ -396,17 +390,3 @@ código:
   generación de CSV/gráficos.
 
 ---
-
-## Referencias (del informe)
-
-1. N. Ahmed, T. Natarajan, K. R. Rao, "Discrete Cosine Transform," *IEEE
-   Trans. Computers*, 1974.
-2. K. R. Rao, P. Yip, *Discrete Cosine Transform: Algorithms, Advantages,
-   Applications*, Academic Press, 1990.
-3. G. K. Wallace, "The JPEG Still Picture Compression Standard," *IEEE
-   Trans. Consumer Electronics*, 1992.
-4. CCITT, Recommendation T.81, 1992.
-5. A. M. Raid et al., "Jpeg Image Compression Using Discrete Cosine
-   Transform – A Survey," 2014.
-6–10. Ver PDF del informe (`ASSDTP4_Grupo1.pdf`) para el resto de las
-   referencias, incluyendo SSIM (Wang et al., 2004).
